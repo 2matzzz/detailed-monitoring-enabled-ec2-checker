@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"encoding/csv"
+	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -14,6 +16,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/aws/smithy-go"
+	"github.com/aws/smithy-go/transport/http"
 )
 
 type InstanceInfo struct {
@@ -34,11 +38,34 @@ type ASGInfo struct {
 }
 
 func main() {
+	checkCmd := flag.NewFlagSet("check", flag.ExitOnError)
+	disableCmd := flag.NewFlagSet("disable", flag.ExitOnError)
+
 	if len(os.Args) < 2 {
-		log.Fatal("No profiles specified. Usage: go run main.go <profile1> [profile2] ...")
+		fmt.Println("expected 'check' or 'disable' subcommands")
+		os.Exit(1)
 	}
 
-	profiles := os.Args[1:]
+	var profiles []string
+	switch os.Args[1] {
+	case "check":
+		checkCmd.Parse(os.Args[2:])
+		profiles = checkCmd.Args()
+		if len(profiles) == 0 {
+			log.Fatal("No profiles specified for check. Usage: go run main.go check <profile1> [profile2] ...")
+		}
+	case "disable":
+		disableCmd.Parse(os.Args[2:])
+		profiles = disableCmd.Args()
+		if len(profiles) == 0 {
+			log.Fatal("No profiles specified for disable. Usage: go run main.go disable <profile1> [profile2] ...")
+		}
+	default:
+		fmt.Println("expected 'check' or 'disable' subcommands")
+		os.Exit(1)
+	}
+
+	action := os.Args[1]
 
 	var allInstances []InstanceInfo
 	var allASGs = make(map[string]ASGInfo)
@@ -66,8 +93,8 @@ func main() {
 				log.Fatalf("unable to get account ID for profile %s: %v", profile, err)
 			}
 
-			ec2Client := ec2.NewFromConfig(cfg)
-			regions, err := getRegions(ec2Client)
+			baseEC2Client := ec2.NewFromConfig(cfg)
+			regions, err := getRegions(baseEC2Client)
 			if err != nil {
 				log.Fatalf("unable to describe regions for profile %s: %v", profile, err)
 			}
@@ -81,8 +108,8 @@ func main() {
 					regionCfg := cfg.Copy()
 					regionCfg.Region = region
 
-					ec2Client = ec2.NewFromConfig(regionCfg)
-					instances, err := getInstances(ec2Client, regionCfg, accountID)
+					regionalEC2Client := ec2.NewFromConfig(regionCfg)
+					instances, err := getInstances(regionalEC2Client, regionCfg, accountID)
 					if err != nil {
 						log.Fatalf("unable to describe instances for profile %s in region %s: %v", profile, region, err)
 					}
@@ -106,6 +133,10 @@ func main() {
 						}
 					}
 					mutex.Unlock()
+
+					if action == "disable" {
+						disableMonitoring(regionalEC2Client, instances, accountID, region)
+					}
 				}(region)
 			}
 		}(profile)
@@ -113,15 +144,13 @@ func main() {
 
 	wg.Wait()
 
-	saveInstancesToCSV(allInstances, "detailed-monitoring-enabled-ec2-list.csv")
-
-	saveASGsToCSV(allASGs, "asg-list.csv")
-
-	saveMapToCSV(launchTemplates, "launch-template-list.csv", "LaunchTemplate")
-
-	saveMapToCSV(launchConfigurations, "launch-configuration-list.csv", "LaunchConfiguration")
-
-	fmt.Println("CSV export completed successfully.")
+	if action == "check" {
+		saveInstancesToCSV(allInstances, "detailed-monitoring-enabled-ec2-list.csv")
+		saveASGsToCSV(allASGs, "asg-list.csv")
+		saveMapToCSV(launchTemplates, "launch-template-list.csv", "LaunchTemplate")
+		saveMapToCSV(launchConfigurations, "launch-configuration-list.csv", "LaunchConfiguration")
+		fmt.Println("CSV export completed successfully.")
+	}
 }
 
 func getAccountID(client *sts.Client) (string, error) {
@@ -282,5 +311,50 @@ func saveMapToCSV(data map[string]struct{}, filename, header string) {
 		if err != nil {
 			log.Fatal("Could not write CSV data", err)
 		}
+	}
+}
+
+func disableMonitoring(ec2Client *ec2.Client, instances []InstanceInfo, accountID string, region string) {
+	var instanceIDs []string
+
+	for _, instance := range instances {
+		if instance.MonitoringState == string(ec2types.MonitoringStateEnabled) {
+			instanceIDs = append(instanceIDs, instance.InstanceID)
+		}
+	}
+
+	const batchSize = 20
+	for i := 0; i < len(instanceIDs); i += batchSize {
+		end := i + batchSize
+		if end > len(instanceIDs) {
+			end = len(instanceIDs)
+		}
+		batch := instanceIDs[i:end]
+
+		_, err := ec2Client.UnmonitorInstances(context.TODO(), &ec2.UnmonitorInstancesInput{
+			InstanceIds: batch,
+		})
+		if err != nil {
+			var ae smithy.APIError
+			if errors.As(err, &ae) {
+				switch ae.ErrorCode() {
+				case "UnauthorizedOperation":
+					log.Printf("Error: AccountID: %s, Region: %s - You do not have permission to unmonitor instances.\n", accountID, region)
+				case "InvalidInstanceID.NotFound":
+					log.Printf("Error: AccountID: %s, Region: %s - Some instance IDs were not found: %s\n", accountID, region, err.Error())
+				case "IncorrectInstanceState":
+					log.Printf("Error: AccountID: %s, Region: %s - The instance is not in a valid state for this operation.\n", accountID, region)
+				case "OptInRequired":
+					log.Printf("Error: AccountID: %s, Region: %s - You are not subscribed to the service required to perform this action.\n", accountID, region)
+				default:
+					log.Printf("EC2 API Error: %s\n", ae.ErrorMessage())
+				}
+			} else if respErr := new(http.ResponseError); errors.As(err, &respErr) {
+				log.Printf("HTTP Error: %s, Status Code: %d\n", respErr.Error(), respErr.HTTPStatusCode())
+			} else {
+				log.Printf("Unknown Error: %s\n", err.Error())
+			}
+		}
+		log.Printf("AccountID: %s, Region: %s - Disabled detailed monitoring for instances: %v", accountID, region, batch)
 	}
 }
