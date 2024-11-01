@@ -183,26 +183,28 @@ func getInstances(ec2Client *ec2.Client, cfg aws.Config, accountID string) ([]In
 	var instances []InstanceInfo
 	for _, reservation := range output.Reservations {
 		for _, instance := range reservation.Instances {
-			var name, asgName string
+			if instance.State != nil && instance.State.Name == ec2types.InstanceStateNameRunning {
+				var name, asgName string
 
-			for _, tag := range instance.Tags {
-				if *tag.Key == "aws:autoscaling:groupName" {
-					asgName = *tag.Value
+				for _, tag := range instance.Tags {
+					if *tag.Key == "aws:autoscaling:groupName" {
+						asgName = *tag.Value
+					}
+					if *tag.Key == "Name" {
+						name = *tag.Value
+					}
 				}
-				if *tag.Key == "Name" {
-					name = *tag.Value
-				}
-			}
 
-			if instance.Monitoring != nil && instance.Monitoring.State == ec2types.MonitoringStateEnabled {
-				instances = append(instances, InstanceInfo{
-					AccountID:       accountID,
-					Region:          cfg.Region,
-					InstanceID:      *instance.InstanceId,
-					Name:            name,
-					MonitoringState: string(instance.Monitoring.State),
-					ASGName:         asgName,
-				})
+				if instance.Monitoring != nil && instance.Monitoring.State == ec2types.MonitoringStateEnabled {
+					instances = append(instances, InstanceInfo{
+						AccountID:       accountID,
+						Region:          cfg.Region,
+						InstanceID:      *instance.InstanceId,
+						Name:            name,
+						MonitoringState: string(instance.Monitoring.State),
+						ASGName:         asgName,
+					})
+				}
 			}
 		}
 	}
