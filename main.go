@@ -78,7 +78,6 @@ func main() {
 		wg.Add(1)
 		go func(profile string) {
 			defer wg.Done()
-			fmt.Println("Processing profile:", profile)
 
 			cfg, err := config.LoadDefaultConfig(context.TODO(),
 				config.WithSharedConfigProfile(profile),
@@ -103,7 +102,7 @@ func main() {
 				wg.Add(1)
 				go func(region string) {
 					defer wg.Done()
-					fmt.Println("Processing region:", region)
+					fmt.Printf("Processing profile: %s, region: %s\n", profile, region)
 
 					regionCfg := cfg.Copy()
 					regionCfg.Region = region
