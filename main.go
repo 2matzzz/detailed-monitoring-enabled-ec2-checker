@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -15,6 +16,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/autoscaling"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/aws-sdk-go-v2/service/elasticbeanstalk"
+	ebtypes "github.com/aws/aws-sdk-go-v2/service/elasticbeanstalk/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/aws/smithy-go"
 	"github.com/aws/smithy-go/transport/http"
@@ -35,6 +38,12 @@ type ASGInfo struct {
 	ASGName             string
 	LaunchTemplate      string
 	LaunchConfiguration string
+}
+
+type EnvironmentCache struct {
+	environmentAppMap   map[string]string
+	environmentSettings map[string][]ebtypes.ConfigurationOptionSetting
+	ebClient            *elasticbeanstalk.Client
 }
 
 func main() {
@@ -108,7 +117,9 @@ func main() {
 					regionCfg.Region = region
 
 					regionalEC2Client := ec2.NewFromConfig(regionCfg)
-					instances, err := getInstances(regionalEC2Client, regionCfg, accountID)
+					regionalEbClient := elasticbeanstalk.NewFromConfig(regionCfg)
+					cache := NewEnvironmentCache(regionalEbClient)
+					instances, err := getInstances(regionalEC2Client, cache, regionCfg, accountID)
 					if err != nil {
 						log.Fatalf("unable to describe instances for profile %s in region %s: %v", profile, region, err)
 					}
@@ -152,6 +163,14 @@ func main() {
 	}
 }
 
+func NewEnvironmentCache(ebClient *elasticbeanstalk.Client) *EnvironmentCache {
+	return &EnvironmentCache{
+		environmentAppMap:   make(map[string]string),
+		environmentSettings: make(map[string][]ebtypes.ConfigurationOptionSetting),
+		ebClient:            ebClient,
+	}
+}
+
 func getAccountID(client *sts.Client) (string, error) {
 	output, err := client.GetCallerIdentity(context.TODO(), &sts.GetCallerIdentityInput{})
 	if err != nil {
@@ -173,7 +192,107 @@ func getRegions(client *ec2.Client) ([]string, error) {
 	return regions, nil
 }
 
-func getInstances(ec2Client *ec2.Client, cfg aws.Config, accountID string) ([]InstanceInfo, error) {
+func (cache *EnvironmentCache) GetApplicationName(ctx context.Context, environmentName string) (string, error) {
+	if appName, exists := cache.environmentAppMap[environmentName]; exists {
+		return appName, nil
+	}
+
+	output, err := cache.ebClient.DescribeEnvironments(ctx, &elasticbeanstalk.DescribeEnvironmentsInput{
+		EnvironmentNames: []string{environmentName},
+	})
+	if err != nil {
+		return "", err
+	}
+
+	if len(output.Environments) == 0 {
+		return "", fmt.Errorf("environment %s not found", environmentName)
+	}
+
+	appName := *output.Environments[0].ApplicationName
+	cache.environmentAppMap[environmentName] = appName
+	return appName, nil
+}
+
+func (cache *EnvironmentCache) GetEnvironmentSettings(ctx context.Context, applicationName, environmentName string) ([]ebtypes.ConfigurationOptionSetting, error) {
+	cacheKey := fmt.Sprintf("%s:%s", applicationName, environmentName)
+	if settings, exists := cache.environmentSettings[cacheKey]; exists {
+		return settings, nil
+	}
+
+	output, err := cache.ebClient.DescribeConfigurationSettings(ctx, &elasticbeanstalk.DescribeConfigurationSettingsInput{
+		ApplicationName: aws.String(applicationName),
+		EnvironmentName: aws.String(environmentName),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if len(output.ConfigurationSettings) == 0 {
+		return nil, fmt.Errorf("no configuration settings found for environment %s", environmentName)
+	}
+
+	settings := output.ConfigurationSettings[0].OptionSettings
+	cache.environmentSettings[cacheKey] = settings
+	return settings, nil
+}
+
+func isExcludedInstance(ctx context.Context, instance ec2types.Instance, cache *EnvironmentCache) (bool, error) {
+	var environmentName string
+
+	for _, tag := range instance.Tags {
+		if strings.HasPrefix(*tag.Key, "elasticbeanstalk:environment-name") {
+			environmentName = *tag.Value
+			break
+		}
+	}
+
+	if environmentName == "" {
+		// log.Printf("Instance %s does not belong to an Elastic Beanstalk environment", *instance.InstanceId)
+		return false, nil
+	}
+
+	// log.Printf("Fetching application name for environment: %s", environmentName)
+	applicationName, err := cache.GetApplicationName(ctx, environmentName)
+	if err != nil {
+		// log.Printf("Error fetching application name: %v", err)
+		return false, err
+	}
+	// log.Printf("Application name for environment %s: %s", environmentName, applicationName)
+
+	// log.Printf("Fetching environment settings for application: %s, environment: %s", applicationName, environmentName)
+	settings, err := cache.GetEnvironmentSettings(ctx, applicationName, environmentName)
+	if err != nil {
+		// log.Printf("Error fetching environment settings: %v", err)
+		return false, err
+	}
+	// log.Printf("Settings for application %s, environment %s: %+v", applicationName, environmentName, settings)
+
+	// Check monitoring setting
+	found := false
+	for _, option := range settings {
+		// log.Printf("Option - Namespace: %s, OptionName: %s, ResourceName: %s, Value: %s",
+		// 	aws.ToString(option.Namespace),
+		// 	aws.ToString(option.OptionName),
+		// 	aws.ToString(option.ResourceName),
+		// 	aws.ToString(option.Value),
+		// )
+		if aws.ToString(option.Namespace) == "aws:elasticbeanstalk:healthreporting:system" &&
+			aws.ToString(option.OptionName) == "SystemType" {
+			// log.Printf("SystemType option found: %s", aws.ToString(option.Value))
+			if aws.ToString(option.Value) == "enhanced" {
+				return true, nil
+			}
+		}
+	}
+
+	if !found {
+		// log.Printf("Monitoring option not found in settings for environment: %s", environmentName)
+	}
+
+	return false, nil
+}
+
+func getInstances(ec2Client *ec2.Client, cache *EnvironmentCache, cfg aws.Config, accountID string) ([]InstanceInfo, error) {
 	output, err := ec2Client.DescribeInstances(context.TODO(), &ec2.DescribeInstancesInput{})
 	if err != nil {
 		return nil, err
@@ -183,8 +302,16 @@ func getInstances(ec2Client *ec2.Client, cfg aws.Config, accountID string) ([]In
 	for _, reservation := range output.Reservations {
 		for _, instance := range reservation.Instances {
 			if instance.State != nil && instance.State.Name == ec2types.InstanceStateNameRunning {
-				var name, asgName string
+				exclude, err := isExcludedInstance(context.TODO(), instance, cache)
+				if err != nil {
+					log.Printf("Error: AccountID: %s, Region: %s - %s\n", accountID, cfg.Region, err.Error())
+					continue
+				}
+				if exclude {
+					continue
+				}
 
+				var name, asgName string
 				for _, tag := range instance.Tags {
 					if *tag.Key == "aws:autoscaling:groupName" {
 						asgName = *tag.Value
