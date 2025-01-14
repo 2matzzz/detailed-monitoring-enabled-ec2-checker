@@ -90,6 +90,7 @@ func main() {
 
 			cfg, err := config.LoadDefaultConfig(context.TODO(),
 				config.WithSharedConfigProfile(profile),
+				config.WithClientLogMode(aws.LogRetries),
 			)
 			if err != nil {
 				log.Fatalf("unable to load SDK config for profile %s: %v", profile, err)
