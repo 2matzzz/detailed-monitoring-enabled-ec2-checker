@@ -294,7 +294,17 @@ func isExcludedInstance(ctx context.Context, instance ec2types.Instance, cache *
 }
 
 func getInstances(ec2Client *ec2.Client, cache *EnvironmentCache, cfg aws.Config, accountID string) ([]InstanceInfo, error) {
-	output, err := ec2Client.DescribeInstances(context.TODO(), &ec2.DescribeInstancesInput{})
+	var output *ec2.DescribeInstancesOutput
+	var err error
+	for i := 0; i < 3; i++ {
+		output, err = ec2Client.DescribeInstances(context.TODO(), &ec2.DescribeInstancesInput{})
+		if err == nil {
+			break
+		}
+		if i < 2 {
+			log.Printf("Retrying DescribeInstances due to error: %v", err)
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
