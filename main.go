@@ -11,7 +11,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -252,9 +254,16 @@ func (s *AWSService) GetRegions(ctx context.Context) ([]string, error) {
 func (s *AWSService) GetInstances(ctx context.Context, cache *EnvironmentCache, region, accountID string) ([]InstanceInfo, error) {
 	var instances []InstanceInfo
 	var nextToken *string
+	pageCount := 0
+	maxPages := 1000 // Safety limit to prevent infinite loops
 
 	// Use pagination to handle large numbers of instances efficiently
 	for {
+		pageCount++
+		if pageCount > maxPages {
+			log.Error().Str("region", region).Int("max_pages", maxPages).Msg("Reached maximum page limit, breaking pagination")
+			break
+		}
 		var output *ec2.DescribeInstancesOutput
 
 		// Use retry strategy for API calls
@@ -321,10 +330,15 @@ func (s *AWSService) GetInstances(ctx context.Context, cache *EnvironmentCache, 
 		if output.NextToken == nil {
 			break
 		}
+
+		// Prevent infinite loops by checking if token changed
+		if nextToken != nil && output.NextToken != nil && *nextToken == *output.NextToken {
+			log.Error().Str("region", region).Str("token", *nextToken).Msg("NextToken not advancing, breaking pagination loop")
+			break
+		}
+
 		nextToken = output.NextToken
 
-		// Add progress logging for large datasets
-		log.Debug().Int("instances_found", len(instances)).Str("region", region).Msg("Processing instances page")
 	}
 
 	log.Info().Int("total_instances", len(instances)).Str("region", region).Msg("Completed instance discovery")
@@ -485,7 +499,7 @@ const (
 	defaultBatchSize      = 20
 	defaultMaxConcurrency = 10
 	defaultAPITimeout     = 30 * time.Second
-	defaultTotalTimeout   = 10 * time.Minute
+	defaultTotalTimeout   = 20 * time.Minute
 )
 
 // Config represents the application configuration
@@ -717,20 +731,12 @@ func main() {
 		}
 	}
 
-	// Set log format - redirect to file when progress bar is shown
+	// Set log format - completely suppress output when progress bar is shown
 	var logOutput *os.File
 	if appConfig.ShowProgress && !appConfig.Verbose {
-		// Create log file for progress mode
-		var err error
-		logOutput, err = os.OpenFile("ec2-checker.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if err != nil {
-			logOutput = os.Stderr
-		}
-		defer func() {
-			if logOutput != os.Stderr {
-				logOutput.Close()
-			}
-		}()
+		// Suppress all log output during progress bar display
+		logOutput, _ = os.Open(os.DevNull)
+		defer logOutput.Close()
 	} else {
 		logOutput = os.Stderr
 	}
@@ -765,6 +771,10 @@ func main() {
 	checkCmd := flag.NewFlagSet("check", flag.ExitOnError)
 	disableCmd := flag.NewFlagSet("disable", flag.ExitOnError)
 
+	// Add verbose flag to subcommands
+	checkVerbose := checkCmd.Bool("verbose", false, "Enable verbose logging")
+	disableVerbose := disableCmd.Bool("verbose", false, "Enable verbose logging")
+
 	if len(os.Args) < 2 {
 		fmt.Println("expected 'check' or 'disable' subcommands")
 		os.Exit(1)
@@ -778,11 +788,69 @@ func main() {
 		if len(profiles) == 0 {
 			log.Fatal().Msg("No profiles specified for check. Usage: go run main.go check <profile1> [profile2] ...")
 		}
+		if *checkVerbose {
+			appConfig.Verbose = true
+			appConfig.LogLevel = "debug"
+			// Re-configure logging for verbose mode
+			zerolog.SetGlobalLevel(zerolog.DebugLevel)
+			logOutput := os.Stderr
+			log.Logger = zerolog.New(zerolog.ConsoleWriter{
+				Out:        logOutput,
+				TimeFormat: "15:04:05",
+				FormatLevel: func(i interface{}) string {
+					switch i {
+					case "debug":
+						return "DEBUG"
+					case "info":
+						return "INFO"
+					case "warn":
+						return "WARN"
+					case "error":
+						return "ERROR"
+					case "fatal":
+						return "FATAL"
+					case "panic":
+						return "PANIC"
+					default:
+						return strings.ToUpper(fmt.Sprintf("%s", i))
+					}
+				},
+			}).With().Timestamp().Logger()
+		}
 	case "disable":
 		disableCmd.Parse(os.Args[2:])
 		profiles = disableCmd.Args()
 		if len(profiles) == 0 {
 			log.Fatal().Msg("No profiles specified for disable. Usage: go run main.go disable <profile1> [profile2] ...")
+		}
+		if *disableVerbose {
+			appConfig.Verbose = true
+			appConfig.LogLevel = "debug"
+			// Re-configure logging for verbose mode
+			zerolog.SetGlobalLevel(zerolog.DebugLevel)
+			logOutput := os.Stderr
+			log.Logger = zerolog.New(zerolog.ConsoleWriter{
+				Out:        logOutput,
+				TimeFormat: "15:04:05",
+				FormatLevel: func(i interface{}) string {
+					switch i {
+					case "debug":
+						return "DEBUG"
+					case "info":
+						return "INFO"
+					case "warn":
+						return "WARN"
+					case "error":
+						return "ERROR"
+					case "fatal":
+						return "FATAL"
+					case "panic":
+						return "PANIC"
+					default:
+						return strings.ToUpper(fmt.Sprintf("%s", i))
+					}
+				},
+			}).With().Timestamp().Logger()
 		}
 	default:
 		fmt.Println("expected 'check' or 'disable' subcommands")
@@ -805,7 +873,6 @@ func main() {
 
 	// Progress tracking
 	var totalRegions int
-	var completedRegions int
 	var progressMutex sync.Mutex
 	var progressBar *SimpleProgressBar
 	var progressInitialized bool
@@ -855,7 +922,7 @@ func main() {
 			progressMutex.Lock()
 			if !progressInitialized && appConfig.ShowProgress && !appConfig.Verbose {
 				totalRegions = len(regions) * len(profiles)
-				progressBar = NewSimpleProgressBar(totalRegions, "Processing regions...")
+				progressBar = NewSimpleProgressBar(totalRegions, "Scanning AWS regions")
 				progressInitialized = true
 			}
 			progressMutex.Unlock()
@@ -867,7 +934,6 @@ func main() {
 					defer func() {
 						// Update progress
 						progressMutex.Lock()
-						completedRegions++
 						if progressBar != nil {
 							progressBar.Add(1)
 						}
@@ -1252,6 +1318,27 @@ func getRelatedAutoScalingGroups(ctx context.Context, asgClient *autoscaling.Cli
 	return relatedASGs, nil
 }
 
+// getTerminalWidth returns the width of the terminal, defaulting to 80 if unable to determine
+func getTerminalWidth() int {
+	type winsize struct {
+		Row    uint16
+		Col    uint16
+		Xpixel uint16
+		Ypixel uint16
+	}
+
+	ws := &winsize{}
+	retCode, _, _ := syscall.Syscall(syscall.SYS_IOCTL,
+		uintptr(syscall.Stderr),
+		uintptr(syscall.TIOCGWINSZ),
+		uintptr(unsafe.Pointer(ws)))
+
+	if int(retCode) == -1 {
+		return 80 // Default width if unable to determine
+	}
+	return int(ws.Col)
+}
+
 // SimpleProgressBar provides a clean, single-line progress display
 type SimpleProgressBar struct {
 	total       int
@@ -1288,22 +1375,39 @@ func (p *SimpleProgressBar) Add(delta int) {
 
 func (p *SimpleProgressBar) render() {
 	percentage := float64(p.current) / float64(p.total) * 100
-	width := 40
-	filled := int(percentage / 100 * float64(width))
+	termWidth := getTerminalWidth()
 
-	bar := strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
+	// Calculate available space for the progress bar
+	prefix := fmt.Sprintf("%s %3.0f%% ", p.description, percentage)
+	suffix := fmt.Sprintf(" (%d/%d regions)", p.current, p.total)
+	availableWidth := termWidth - len(prefix) - len(suffix) - 2 // -2 for the | | brackets
 
-	// Clear the line and print progress
-	fmt.Fprintf(os.Stderr, "\r%s %3.0f%% |%s| (%d/%d)",
-		p.description, percentage, bar, p.current, p.total)
+	// Minimum bar width
+	if availableWidth < 10 {
+		availableWidth = 10
+	}
+
+	filled := int(percentage / 100 * float64(availableWidth))
+	bar := strings.Repeat("=", filled) + strings.Repeat("-", availableWidth-filled)
+
+	// Create the progress message
+	message := fmt.Sprintf("%s|%s|%s", prefix, bar, suffix)
+
+	// Truncate if still too long for terminal
+	if len(message) > termWidth {
+		message = message[:termWidth-3] + "..."
+	}
+
+	// Use ANSI escape codes for reliable line clearing
+	fmt.Fprintf(os.Stderr, "\033[2K\r%s", message)
 }
 
 func (p *SimpleProgressBar) Finish() {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 
-	// Clear the progress line
-	fmt.Fprintf(os.Stderr, "\r%s\r", strings.Repeat(" ", 80))
+	// Clear the progress line completely using ANSI escape codes
+	fmt.Fprintf(os.Stderr, "\033[2K\r")
 }
 
 // writeCSVAtomic provides atomic CSV writing with transaction-like behavior
