@@ -1,0 +1,23 @@
+# Configuration file for detailed-monitoring-enabled-ec2-checker
+# Copy this to config.yaml and modify as needed
+
+# Maximum number of retries for API calls
+max_retries: 3
+
+# Batch size for processing instances
+batch_size: 20
+
+# Maximum number of concurrent goroutines
+max_concurrency: 10
+
+# Timeout for individual API calls
+api_timeout: 30s
+
+# Total timeout for the entire operation
+total_timeout: 10m
+
+# Log level: debug, info, warn, error
+log_level: info
+
+# Log format: console or json
+log_format: console
