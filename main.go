@@ -248,46 +248,28 @@ func isExcludedInstance(ctx context.Context, instance ec2types.Instance, cache *
 	}
 
 	if environmentName == "" {
-		// log.Printf("Instance %s does not belong to an Elastic Beanstalk environment", *instance.InstanceId)
 		return false, nil
 	}
 
-	// log.Printf("Fetching application name for environment: %s", environmentName)
 	applicationName, err := cache.GetApplicationName(ctx, environmentName)
 	if err != nil {
-		// log.Printf("Error fetching application name: %v", err)
 		return false, err
 	}
-	// log.Printf("Application name for environment %s: %s", environmentName, applicationName)
 
-	// log.Printf("Fetching environment settings for application: %s, environment: %s", applicationName, environmentName)
 	settings, err := cache.GetEnvironmentSettings(ctx, applicationName, environmentName)
 	if err != nil {
-		// log.Printf("Error fetching environment settings: %v", err)
 		return false, err
 	}
-	// log.Printf("Settings for application %s, environment %s: %+v", applicationName, environmentName, settings)
 
 	// Check monitoring setting
 	found := false
 	for _, option := range settings {
-		// log.Printf("Option - Namespace: %s, OptionName: %s, ResourceName: %s, Value: %s",
-		// 	aws.ToString(option.Namespace),
-		// 	aws.ToString(option.OptionName),
-		// 	aws.ToString(option.ResourceName),
-		// 	aws.ToString(option.Value),
-		// )
 		if aws.ToString(option.Namespace) == "aws:elasticbeanstalk:healthreporting:system" &&
 			aws.ToString(option.OptionName) == "SystemType" {
-			// log.Printf("SystemType option found: %s", aws.ToString(option.Value))
 			if aws.ToString(option.Value) == "enhanced" {
 				return true, nil
 			}
 		}
-	}
-
-	if !found {
-		// log.Printf("Monitoring option not found in settings for environment: %s", environmentName)
 	}
 
 	return false, nil
@@ -356,32 +338,43 @@ func getRelatedAutoScalingGroups(asgClient *autoscaling.Client, instances []Inst
 		}
 	}
 
-	output, err := asgClient.DescribeAutoScalingGroups(context.TODO(), &autoscaling.DescribeAutoScalingGroupsInput{})
+	// If no ASG names found, return empty slice
+	if len(asgNames) == 0 {
+		return []ASGInfo{}, nil
+	}
+
+	// Convert map to slice for API call
+	var asgNamesList []string
+	for name := range asgNames {
+		asgNamesList = append(asgNamesList, name)
+	}
+
+	output, err := asgClient.DescribeAutoScalingGroups(context.TODO(), &autoscaling.DescribeAutoScalingGroupsInput{
+		AutoScalingGroupNames: asgNamesList,
+	})
 	if err != nil {
 		return nil, err
 	}
 
 	var relatedASGs []ASGInfo
 	for _, asg := range output.AutoScalingGroups {
-		if _, exists := asgNames[*asg.AutoScalingGroupName]; exists {
-			var launchTemplate, launchConfig string
+		var launchTemplate, launchConfig string
 
-			if asg.LaunchTemplate != nil {
-				launchTemplate = *asg.LaunchTemplate.LaunchTemplateId
-			}
-
-			if asg.LaunchConfigurationName != nil {
-				launchConfig = *asg.LaunchConfigurationName
-			}
-
-			relatedASGs = append(relatedASGs, ASGInfo{
-				AccountID:           accountID,
-				Region:              region,
-				ASGName:             *asg.AutoScalingGroupName,
-				LaunchTemplate:      launchTemplate,
-				LaunchConfiguration: launchConfig,
-			})
+		if asg.LaunchTemplate != nil {
+			launchTemplate = *asg.LaunchTemplate.LaunchTemplateId
 		}
+
+		if asg.LaunchConfigurationName != nil {
+			launchConfig = *asg.LaunchConfigurationName
+		}
+
+		relatedASGs = append(relatedASGs, ASGInfo{
+			AccountID:           accountID,
+			Region:              region,
+			ASGName:             *asg.AutoScalingGroupName,
+			LaunchTemplate:      launchTemplate,
+			LaunchConfiguration: launchConfig,
+		})
 	}
 	return relatedASGs, nil
 }
@@ -440,15 +433,15 @@ func saveMapToCSV(data map[string]struct{}, filename, header string) {
 	}
 	defer file.Close()
 
-	_, err = file.WriteString(fmt.Sprintf("AccountID,Region,%s\n", header))
-	if err != nil {
-		log.Fatal("Could not write CSV header", err)
-	}
+	writer := csv.NewWriter(file)
+	defer writer.Flush()
+
+	writer.Write([]string{"AccountID", "Region", header})
 
 	for key := range data {
-		_, err := file.WriteString(fmt.Sprintf("%s\n", key))
-		if err != nil {
-			log.Fatal("Could not write CSV data", err)
+		parts := strings.Split(key, ",")
+		if len(parts) == 3 {
+			writer.Write(parts)
 		}
 	}
 }
