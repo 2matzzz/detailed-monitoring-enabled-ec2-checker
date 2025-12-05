@@ -433,8 +433,9 @@ func (s *AWSService) GetRelatedAutoScalingGroups(ctx context.Context, instances 
 	return relatedASGs, nil
 }
 
-func (s *AWSService) DisableMonitoring(ctx context.Context, instances []InstanceInfo, accountID, region string) error {
+func (s *AWSService) DisableMonitoring(ctx context.Context, instances []InstanceInfo, accountID, region string) ([]string, error) {
 	var instanceIDs []string
+	var disabledARNs []string
 
 	for _, instance := range instances {
 		if instance.MonitoringState == string(ec2types.MonitoringStateEnabled) {
@@ -451,6 +452,11 @@ func (s *AWSService) DisableMonitoring(ctx context.Context, instances []Instance
 
 		if s.config.DryRun {
 			log.Info().Str("accountID", accountID).Str("region", region).Strs("instances", batch).Msg("DRY RUN: Would disable detailed monitoring for instances")
+			// Collect ARNs even for dry-run
+			for _, instanceID := range batch {
+				arn := fmt.Sprintf("arn:aws:ec2:%s:%s:instance/%s", region, accountID, instanceID)
+				disabledARNs = append(disabledARNs, arn)
+			}
 			continue
 		}
 
@@ -485,12 +491,19 @@ func (s *AWSService) DisableMonitoring(ctx context.Context, instances []Instance
 			} else {
 				log.Error().Err(err).Msg("Unknown Error")
 			}
-			return NewAWSError("failed to disable monitoring", "", region, err)
+			return disabledARNs, NewAWSError("failed to disable monitoring", "", region, err)
 		}
+
+		// Collect ARNs of instances that had detailed monitoring disabled
+		for _, instanceID := range batch {
+			arn := fmt.Sprintf("arn:aws:ec2:%s:%s:instance/%s", region, accountID, instanceID)
+			disabledARNs = append(disabledARNs, arn)
+		}
+
 		log.Info().Str("accountID", accountID).Str("region", region).Strs("instances", batch).Msg("Disabled detailed monitoring for instances")
 	}
 
-	return nil
+	return disabledARNs, nil
 }
 
 // Default configuration values
@@ -863,9 +876,11 @@ func main() {
 	var allASGs = make(map[string]ASGInfo)
 	var launchTemplates = make(map[string]struct{})
 	var launchConfigurations = make(map[string]struct{})
+	var disabledARNs []string
 	var errors []string
 	var mutex sync.Mutex
 	var errorMutex sync.Mutex
+	var disabledARNsMutex sync.Mutex
 	var wg sync.WaitGroup
 
 	// Semaphore to limit concurrency
@@ -993,8 +1008,14 @@ func main() {
 					mutex.Unlock()
 
 					if action == "disable" {
-						if err := regionalService.DisableMonitoring(ctx, instances, accountID, region); err != nil {
+						arns, err := regionalService.DisableMonitoring(ctx, instances, accountID, region)
+						if err != nil {
 							log.Error().Err(err).Str("profile", profile).Str("region", region).Msg("Failed to disable monitoring")
+						}
+						if len(arns) > 0 {
+							disabledARNsMutex.Lock()
+							disabledARNs = append(disabledARNs, arns...)
+							disabledARNsMutex.Unlock()
 						}
 					}
 				}(region)
@@ -1008,6 +1029,19 @@ func main() {
 	if progressBar != nil {
 		progressBar.Finish()
 		fmt.Println() // Add newline after progress bar
+		// Restore logging to stderr after progress bar completes
+		zerolog.SetGlobalLevel(zerolog.InfoLevel)
+		log.Logger = zerolog.New(zerolog.ConsoleWriter{
+			Out:        os.Stderr,
+			TimeFormat: "15:04:05",
+		}).With().Timestamp().Logger()
+	}
+
+	// Output disabled instance ARNs after progress bar completes
+	if action == "disable" && len(disabledARNs) > 0 {
+		for _, arn := range disabledARNs {
+			log.Info().Str("arn", arn).Msg("Disabled detailed monitoring")
+		}
 	}
 
 	// Report any errors
